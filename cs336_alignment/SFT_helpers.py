@@ -39,3 +39,75 @@ def tokenize_prompt_and_output(prompt_strs, output_strs, tokenizer):
     output_dict["response_mask"] = response_mask
 
     return output_dict
+
+def compute_entropy(logits:torch.Tensor)-> torch.Tensor:
+    max_value=torch.max(logits, dim=-1, keepdim=True).values
+    logits-=max_value
+    exp_logits=torch.exp(logits)
+    sum_exp=torch.sum(exp_logits,dim=-1,keepdim=True)
+    probs=exp_logits/sum_exp
+    return -probs*(logits-torch.log(sum_exp)).sum(dim=-1)
+
+def get_response_log_probs(
+    model,
+    input_ids,
+    labels,
+    return_token_entropy=False,
+    )-> dict[str, torch.Tensor]:
+
+    out = model(input_ids)
+    logits = out.logits
+    B, T, V = logits.shape
+
+    log_probs_vocab = torch.nn.functional.log_softmax(logits, dim=-1)
+
+    target = labels[:, 1:]
+
+    log_probs_next = log_probs_vocab[:, :-1, :].gather(
+        dim=-1, index=target.clamp(min=0).unsqueeze(-1)
+    ).squeeze(-1)
+
+    log_probs = torch.zeros((B, T), device=logits.device, dtype=log_probs_next.dtype)
+    log_probs[:, 1:] = log_probs_next
+
+    result = {"log_probs": log_probs}
+
+    if return_token_entropy:
+        result["token_entropy"] = compute_entropy(logits)  # (B, T)
+
+    return result
+
+def masked_normalize(
+    tensor: torch.Tensor,
+    mask: torch.Tensor,
+    normalize_constant:float,
+    dim:int|None= None,
+)-> torch.Tensor:
+
+    tensor=tensor*mask
+
+    tensor=torch.sum(tensor, dim=dim)
+
+    tensor/=normalize_constant
+
+    return tensor
+
+def sft_microbatch_train_step(
+    policy_log_probs:torch.Tensor,
+    response_mask:torch.Tensor,
+    gradient_accumulation_steps: int,
+    normalize_constant:float =1.0,
+)-> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+
+    normalized_log_probs=masked_normalize(policy_log_probs, response_mask, normalize_constant)
+
+    neg_log_probs=-normalized_log_probs
+
+    loss=neg_log_probs/gradient_accumulation_steps
+
+    loss.backward()
+
+    metadata = {
+        "loss_scaled": loss.detach(),
+    }
+    return loss.detach(), metadata
